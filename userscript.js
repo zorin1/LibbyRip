@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2025-10-04
+// @version       2025-11-18
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -12,7 +12,7 @@
 // @match         *://*.read.overdrive.com/?*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
-// @require       https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js
+// @require       https://unpkg.com/client-zip@2.5.0/worker.js
 // @grant         none
 // ==/UserScript==
 
@@ -227,14 +227,21 @@
 
     }
 
-    async function createMetadata(zip){
-        let folder = zip.folder("metadata");
+    async function createMetadata(){
         let metadata = getMetadata();
         const response = await fetch(metadata.coverUrl);
         const blob = await response.blob();
         const csplit = metadata.coverUrl.split(".");
-        folder.file("cover." + csplit[csplit.length-1], blob, { compression: "STORE" });
-        folder.file("metadata.json", JSON.stringify(metadata, null, 2));
+        return [
+            {
+                name: "metadata/cover." + csplit[csplit.length-1],
+                input: blob
+            },
+            {
+                name: "metadata/metadata.json",
+                input: JSON.stringify(metadata, null, 2)
+            }
+        ];
     }
     function generateTOCFFmpeg(metadata){
         if (!metadata.chapters) return null;
@@ -403,9 +410,9 @@
 
 
     async function createAndDownloadZip(urls, addMeta) {
-        const zip = new JSZip();
+        const files = [];
 
-        // Fetch all files and add them to the zip
+        // Fetch all files and add them to the files array
         const fetchPromises = urls.map(async (url) => {
             const response = await fetch(url.url);
             const blob = await response.blob();
@@ -418,30 +425,31 @@
 
             downloadState += 1;
 
-            zip.file(filename, blob, { compression: "STORE" });
+            return {
+                name: filename,
+                input: blob
+            };
         });
-        if (addMeta)
-            fetchPromises.push(createMetadata(zip));
-
-        // Wait for all files to be fetched and added to the zip
-        await Promise.all(fetchPromises);
-
+        
+        // Start metadata creation in parallel with file downloads
+        const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
+        
+        // Wait for both file downloads and metadata creation to complete
+        const [downloadedFiles, metadataFiles] = await Promise.all([
+            Promise.all(fetchPromises),
+            metadataPromise
+        ]);
+        
+        files.push(...downloadedFiles);
+        files.push(...metadataFiles);
 
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
-        downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%";
+        downloadElem.innerHTML += "Generating zip file...";
 
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         // Generate the zip file
-        const zipBlob = await zip.generateAsync({
-            type: 'blob',
-            compression: "STORE",
-            streamFiles: true,
-        }, (meta)=>{
-            if (meta.percent)
-                downloadElem.querySelector("#zipProg").textContent = meta.percent.toFixed(2);
-
-        });
+        const zipBlob = await downloadZip(files).blob();
 
         downloadElem.innerHTML += "Generated zip file! <br>"
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -567,7 +575,7 @@
         const pathname = parsedUrl.pathname;
         return pathname.substring(pathname.lastIndexOf('/') + 1);
     }
-    async function createContent(oebps, imgAssests){
+    async function createContent(files, imgAssests){
 
         let cssRegistry = {};
 
@@ -611,7 +619,10 @@
         for (let i of Object.keys(window.pages)){
             if (idToIfram[i])
                 url = idToIfram[i].src;
-            oebps.file(truncate(i), fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || []));
+            files.push({
+                name: "OEBPS/" + truncate(i),
+                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+            });
         }
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
@@ -628,7 +639,10 @@
             }
             const blob = await response.blob();
 
-            oebps.file(name.startsWith("http") ? getFilenameFromURL(name) : name, blob, { compression: "STORE" });
+            files.push({
+                name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                input: blob
+            });
 
             gc+=1;
             downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
@@ -747,7 +761,7 @@
         const ext = fileName.split('.').pop().toLowerCase();
         return mimeTypes[ext] || 'application/octet-stream';
     }
-    function makePackage(oebps, assetRegistry){
+    function makePackage(files, assetRegistry){
         const idStore = [];
         const doc = document.implementation.createDocument(
             'http://www.idpf.org/2007/opf', // default namespace
@@ -872,9 +886,12 @@
         const serializer = new XMLSerializer();
         const xmlString = serializer.serializeToString(doc);
 
-        oebps.file("content.opf", `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString);
+        files.push({
+            name: "OEBPS/content.opf",
+            input: `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString
+        });
     }
-    function makeToc(oebps){
+    function makeToc(files){
         // Step 1: Create the document with a default namespace
         const doc = document.implementation.createDocument(
             'http://www.daisy.org/z3986/2005/ncx/', // default namespace
@@ -934,49 +951,53 @@
         const serializer = new XMLSerializer();
         const xmlString = serializer.serializeToString(doc);
 
-        oebps.file("toc.ncx", `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString);
+        files.push({
+            name: "OEBPS/toc.ncx",
+            input: `<?xml version="1.0" encoding="utf-8" standalone="no"?>\n` + xmlString
+        });
     }
     async function downloadEPUB(){
         let imageAssets = new Array();
+        const files = [];
 
+        // Add mimetype file (must be first and uncompressed for EPUB spec)
+        files.push({
+            name: "mimetype",
+            input: "application/epub+zip"
+        });
 
-        const zip = new JSZip();
-        zip.file("mimetype", "application/epub+zip", {compression: "STORE"});
-        let metaInf = zip.folder("META-INF");
-        metaInf.file("container.xml", `<?xml version="1.0" encoding="UTF-8"?>
+        // Add META-INF files
+        files.push({
+            name: "META-INF/container.xml",
+            input: `<?xml version="1.0" encoding="UTF-8"?>
                 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
                     <rootfiles>
                         <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
                     </rootfiles>
                 </container>
-        `);
+        `
+        });
+        
         // Add required encryption file for DRM compliance (required by EPUB spec)
-        metaInf.file("encryption.xml", `<?xml version="1.0" encoding="UTF-8"?>
+        files.push({
+            name: "META-INF/encryption.xml",
+            input: `<?xml version="1.0" encoding="UTF-8"?>
                 <encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>
-        `);
+        `
+        });
 
-        let oebps = zip.folder("OEBPS");
-        await createContent(oebps, imageAssets);
+        await createContent(files, imageAssets);
 
-        makePackage(oebps, imageAssets);
-        makeToc(oebps);
+        makePackage(files, imageAssets);
+        makeToc(files);
 
 
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
-        downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%<br>";
+        downloadElem.innerHTML += "Generating EPUB file...<br>";
 
 
-        // Generate the zip file - mimetype must be first and uncompressed
-        const zipBlob = await zip.generateAsync({
-            type: 'blob',
-            compression: "DEFLATE",
-            streamFiles: true,
-            mimeType: 'application/epub+zip',
-        }, (meta)=>{
-            if (meta.percent)
-                downloadElem.querySelector("#zipProg").textContent = meta.percent.toFixed(2);
-
-        });
+        // Generate the zip file
+        const zipBlob = await downloadZip(files).blob();
 
 
         downloadElem.innerHTML += `EPUB generation complete! Starting download<br>`
